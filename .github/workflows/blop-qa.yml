@@ -1,0 +1,371 @@
+# Blop reference workflow — copy to `.github/workflows/` on your runner repo (default branch).
+# Filename must match the "Workflow file" field in the Blop project (e.g. blop-qa.yml).
+#
+# Manual "Run now": Blop passes workflow_dispatch inputs (run_id, project_id, ingest_url, ingest_secret, base_url).
+#
+# Scheduled / cron runs: create these repository secrets (Settings → Secrets and variables → Actions):
+#   BLOP_PROJECT_ID   — UUID from Blop project settings / URL
+#   BLOP_INGEST_URL   — https://YOUR_PUBLIC_APP_ORIGIN/api/ingest (must be reachable from GitHub runners, not localhost)
+#   BLOP_INGEST_SECRET — same value as the project's ingest secret in Blop
+# Optional:
+#   BLOP_BASE_URL     — URL under test (passed to Playwright as BASE_URL)
+#
+# Add a Playwright test (copy docs/examples/playwright-smoke.e2e.ts → e2e/smoke.spec.ts) and package.json deps.
+# Optional: copy docs/examples/blop-github-actions-post-finish.mjs into this repo and replace the inline Node
+# step with `node path/to/blop-github-actions-post-finish.mjs` to avoid drift.
+#
+# CloudEvents must include data.project_id and data.run_id; scheduled jobs generate a new run_id UUID per run.
+
+name: Blop QA
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Blop run id (set by control plane)
+        required: true
+        type: string
+      project_id:
+        description: Blop project id
+        required: true
+        type: string
+      ingest_url:
+        description: Blop ingest URL (POST CloudEvents)
+        required: true
+        type: string
+      ingest_secret:
+        description: Shared secret for ingest
+        required: true
+        type: string
+      base_url:
+        description: Optional URL under test
+        required: false
+        type: string
+      qa_trigger:
+        description: 'Blop ingest trigger (manual | schedule | healer_verify). Empty defaults to manual.'
+        required: false
+        type: string
+        default: ''
+  schedule:
+    - cron: '15 * * * *'
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    env:
+      CI: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Blop run context
+        id: blop
+        run: |
+          if [ -n "${{ github.event.inputs.run_id }}" ]; then
+            echo "run_id=${{ github.event.inputs.run_id }}" >> "$GITHUB_OUTPUT"
+            T="${{ github.event.inputs.qa_trigger }}"
+            if [ -z "$T" ]; then T=manual; fi
+            echo "trigger=$T" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_id=$(node -p "require('crypto').randomUUID()")" >> "$GITHUB_OUTPUT"
+            echo "trigger=schedule" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post qa.run.started.v1
+        env:
+          RUN_ID: ${{ steps.blop.outputs.run_id }}
+          TRIGGER: ${{ steps.blop.outputs.trigger }}
+          PROJECT_ID: ${{ github.event.inputs.project_id || secrets.BLOP_PROJECT_ID }}
+          INGEST_URL: ${{ github.event.inputs.ingest_url || secrets.BLOP_INGEST_URL }}
+          INGEST_SECRET: ${{ github.event.inputs.ingest_secret || secrets.BLOP_INGEST_SECRET }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          node <<'NODE'
+          const { randomUUID } = require('crypto');
+          const body = {
+            specversion: '1.0',
+            id: randomUUID(),
+            source: 'github.actions:' + process.env.GITHUB_RUN_ID,
+            type: 'qa.run.started.v1',
+            data: {
+              project_id: process.env.PROJECT_ID,
+              run_id: process.env.RUN_ID,
+              trigger: process.env.TRIGGER,
+              github_run_id: process.env.GITHUB_RUN_ID,
+            },
+          };
+          fetch(process.env.INGEST_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-QA-Ingest-Secret': process.env.INGEST_SECRET,
+            },
+            body: JSON.stringify(body),
+          })
+            .then((r) => r.text().then((t) => { if (!r.ok) throw new Error(t || r.status); }))
+            .catch((e) => { console.error(e); process.exit(1); });
+          NODE
+
+      - name: Run Playwright
+        id: pw
+        continue-on-error: true
+        env:
+          BASE_URL: ${{ github.event.inputs.base_url || secrets.BLOP_BASE_URL }}
+          PLAYWRIGHT_JSON_OUTPUT_FILE: blop-results.json
+        run: npx playwright test --reporter=json,line,html --trace=on-first-retry
+
+      - name: Post qa.run.finished.v1 (JSON summary, R2 uploads)
+        if: ${{ !cancelled() }}
+        env:
+          RUN_ID: ${{ steps.blop.outputs.run_id }}
+          TRIGGER: ${{ steps.blop.outputs.trigger }}
+          PROJECT_ID: ${{ github.event.inputs.project_id || secrets.BLOP_PROJECT_ID }}
+          INGEST_URL: ${{ github.event.inputs.ingest_url || secrets.BLOP_INGEST_URL }}
+          INGEST_SECRET: ${{ github.event.inputs.ingest_secret || secrets.BLOP_INGEST_SECRET }}
+          GITHUB_RUN_STATUS: ${{ steps.pw.outcome == 'success' && 'passed' || 'failed' }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          node <<'NODE'
+          const { randomUUID } = require('crypto');
+          const fs = require('fs');
+          const path = require('path');
+          const { execSync } = require('child_process');
+
+          const INGEST_URL = process.env.INGEST_URL || '';
+          const BASE = INGEST_URL.replace(/\/api\/ingest\/?$/, '');
+          const UPLOAD_ENDPOINT = `${BASE}/api/ingest/artifact-upload-url`;
+
+          function collectFailures(report) {
+            const out = [];
+            function visitSuite(suite) {
+              for (const spec of suite.specs || []) {
+                if (spec.ok === false) {
+                  for (const t of spec.tests || []) {
+                    if (t.status === 'unexpected' || t.status === 'failed') {
+                      const last = t.results?.[t.results.length - 1];
+                      const msg =
+                        last?.error?.message ||
+                        last?.errors?.[0]?.message ||
+                        last?.errors?.[0]?.text ||
+                        'failed';
+                      out.push({
+                        test_file: spec.file || 'unknown',
+                        message: String(msg).slice(0, 2000),
+                      });
+                    }
+                  }
+                }
+              }
+              for (const s of suite.suites || []) visitSuite(s);
+            }
+            for (const s of report.suites || []) visitSuite(s);
+            return out;
+          }
+
+          function parseJsonReport(p) {
+            if (!fs.existsSync(p)) return null;
+            try {
+              return JSON.parse(fs.readFileSync(p, 'utf8'));
+            } catch {
+              return null;
+            }
+          }
+
+          function findTraceZip(dir) {
+            if (!fs.existsSync(dir)) return null;
+            function walk(d) {
+              for (const name of fs.readdirSync(d)) {
+                const p = path.join(d, name);
+                const st = fs.statSync(p);
+                if (st.isDirectory()) {
+                  const hit = walk(p);
+                  if (hit) return hit;
+                } else if (name === 'trace.zip') return p;
+              }
+              return null;
+            }
+            return walk(dir);
+          }
+
+          function zipIfExists(outZip, paths) {
+            const exist = paths.filter((p) => fs.existsSync(p));
+            if (exist.length === 0) return false;
+            try {
+              execSync(`zip -qr "${outZip}" ${exist.map((p) => `"${p}"`).join(' ')}`, { stdio: 'inherit' });
+              return fs.existsSync(outZip);
+            } catch {
+              return false;
+            }
+          }
+
+          async function presign(filename, contentType) {
+            const r = await fetch(UPLOAD_ENDPOINT, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-QA-Ingest-Secret': process.env.INGEST_SECRET || '',
+              },
+              body: JSON.stringify({
+                project_id: process.env.PROJECT_ID,
+                run_id: process.env.RUN_ID,
+                filename,
+                content_type: contentType,
+              }),
+            });
+            if (!r.ok) throw new Error(`presign ${filename}: ${await r.text()}`);
+            return r.json();
+          }
+
+          async function putObject(url, body, contentType) {
+            const r = await fetch(url, {
+              method: 'PUT',
+              headers: { 'Content-Type': contentType },
+              body,
+            });
+            if (!r.ok) throw new Error(`PUT: ${await r.text()}`);
+          }
+
+          async function postIngest(body) {
+            const r = await fetch(INGEST_URL, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-QA-Ingest-Secret': process.env.INGEST_SECRET || '',
+              },
+              body: JSON.stringify(body),
+            });
+            if (!r.ok) throw new Error(await r.text());
+          }
+
+          const jsonPath = 'blop-results.json';
+          const rep = parseJsonReport(jsonPath);
+          const ghStatus = process.env.GITHUB_RUN_STATUS === 'passed' ? 'passed' : 'failed';
+
+          let counts = {
+            passed: ghStatus === 'passed' ? 1 : 0,
+            failed: ghStatus === 'passed' ? 0 : 1,
+            skipped: 0,
+            flaky: 0,
+          };
+          let duration_ms = 0;
+          let top_failures = [];
+
+          if (rep && rep.stats) {
+            const s = rep.stats;
+            counts = {
+              passed: s.expected ?? 0,
+              failed: s.unexpected ?? 0,
+              skipped: s.skipped ?? 0,
+              flaky: s.flaky ?? 0,
+            };
+            duration_ms = Math.round(s.duration ?? 0);
+            top_failures = collectFailures(rep).slice(0, 25);
+          }
+
+          const status = counts.failed > 0 ? 'failed' : 'passed';
+          if (status === 'failed' && top_failures.length === 0) {
+            top_failures = [
+              { test_file: 'playwright', message: 'Playwright reported failures (no JSON report)' },
+            ];
+          }
+
+          const artifacts = [];
+
+          try {
+            const tracePath = findTraceZip('test-results');
+            if (tracePath) {
+              const buf = fs.readFileSync(tracePath);
+              const { url, key, bucket } = await presign('trace.zip', 'application/zip');
+              await putObject(url, buf, 'application/zip');
+              artifacts.push({
+                kind: 'trace',
+                path: key,
+                bucket,
+                bytes: buf.length,
+                content_type: 'application/zip',
+              });
+            }
+          } catch (e) {
+            console.warn('Trace upload skipped:', e.message);
+          }
+
+          try {
+            if (
+              zipIfExists('blop-ci-bundle.zip', ['blop-results.json', 'playwright-report', 'test-results'])
+            ) {
+              const buf = fs.readFileSync('blop-ci-bundle.zip');
+              const { url, key, bucket } = await presign('blop-ci-bundle.zip', 'application/zip');
+              await putObject(url, buf, 'application/zip');
+              artifacts.push({
+                kind: 'report_bundle',
+                path: key,
+                bucket,
+                bytes: buf.length,
+                content_type: 'application/zip',
+              });
+            }
+          } catch (e) {
+            console.warn('Bundle upload skipped:', e.message);
+          }
+
+          const server = process.env.GITHUB_SERVER_URL || '';
+          const repo = process.env.GITHUB_REPOSITORY || '';
+          const runId = process.env.GITHUB_RUN_ID || '';
+          const ci_url =
+            server && repo && runId ? `${server}/${repo}/actions/runs/${runId}` : undefined;
+
+          const data = {
+            project_id: process.env.PROJECT_ID,
+            run_id: process.env.RUN_ID,
+            trigger: process.env.TRIGGER,
+            status,
+            counts,
+            duration_ms,
+            artifacts,
+            top_failures,
+          };
+
+          if (process.env.GITHUB_REF_NAME || process.env.GITHUB_SHA || ci_url) {
+            data.ci = {
+              branch: process.env.GITHUB_REF_NAME || undefined,
+              commit_sha: process.env.GITHUB_SHA || undefined,
+              ci_url,
+            };
+          }
+
+          await postIngest({
+            specversion: '1.0',
+            id: randomUUID(),
+            source: 'github.actions:' + runId,
+            type: 'qa.run.finished.v1',
+            data,
+          });
+          NODE
+
+      - name: Fail if Playwright failed
+        if: ${{ steps.pw.outcome != 'success' }}
+        run: exit 1
+
+      - name: Upload CI artefacts (optional)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: blop-qa-${{ github.run_id }}
+          path: |
+            playwright-report
+            test-results
+            blop-results.json
+          retention-days: 7
