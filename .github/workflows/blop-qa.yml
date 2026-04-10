@@ -62,7 +62,10 @@ jobs:
           node-version: lts/*
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          # Install repo deps (requires package-lock.json); then ensure @playwright/test is available.
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          node -e "require.resolve('@playwright/test')" 2>/dev/null || npm install --save-dev @playwright/test
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
@@ -126,8 +129,9 @@ jobs:
       - name: Post qa.run.finished.v1 (JSON summary, R2 uploads)
         if: ${{ !cancelled() }}
         env:
-          RUN_ID: ${{ steps.blop.outputs.run_id }}
-          TRIGGER: ${{ steps.blop.outputs.trigger }}
+          # Fall back to dispatch inputs when blop step was skipped due to earlier failure
+          RUN_ID: ${{ steps.blop.outputs.run_id || github.event.inputs.run_id }}
+          TRIGGER: ${{ steps.blop.outputs.trigger || github.event.inputs.qa_trigger || 'manual' }}
           PROJECT_ID: ${{ github.event.inputs.project_id || secrets.BLOP_PROJECT_ID }}
           INGEST_URL: ${{ github.event.inputs.ingest_url || secrets.BLOP_INGEST_URL }}
           INGEST_SECRET: ${{ github.event.inputs.ingest_secret || secrets.BLOP_INGEST_SECRET }}
@@ -139,6 +143,8 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           node <<'NODE'
+          // Wrapped in async IIFE so require() and top-level await coexist in Node.js v24+
+          ;(async () => {
           const { randomUUID } = require('crypto');
           const fs = require('fs');
           const path = require('path');
@@ -353,6 +359,7 @@ jobs:
             type: 'qa.run.finished.v1',
             data,
           });
+          })().catch(e => { console.error(e.message || e); process.exit(1); });
           NODE
 
       - name: Fail if Playwright failed
