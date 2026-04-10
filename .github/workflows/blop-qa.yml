@@ -63,9 +63,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # Install repo deps (requires package-lock.json); then ensure @playwright/test is available.
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
-          node -e "require.resolve('@playwright/test')" 2>/dev/null || npm install --save-dev @playwright/test
+          # Install @playwright/test (always works regardless of lockfile state)
+          npm install --save-dev @playwright/test
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
